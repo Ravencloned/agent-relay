@@ -1,6 +1,6 @@
 # Agent Relay
 
-**Alpha.** A local, opt-in command line queue for a caller such as Groot to send one turn at a time to a **new, bridge-owned** Claude Code session. It cannot attach to an arbitrary running terminal session. The Claude adapter has not been tested against a live model; mock transport and offline protocol fixtures are tested. No daemon, network listener, tunnel, telemetry, credentials, or autostart is installed.
+**Alpha.** A local, opt-in command line queue for a caller such as Groot to send one turn at a time to a **new, bridge-owned** Claude Code session. It cannot attach to an arbitrary running terminal session. A two-turn, no-tools Claude smoke test passed on Windows with an existing Claude login; broader live use is unverified. No daemon, network listener, tunnel, telemetry, credentials, or autostart is installed.
 
 If an authorized Groot task can already run local commands on an online computer, it can invoke this CLI directly. That attended phone → Groot → local CLI path needs no additional HTTP service. Unattended event delivery while no local task is running would need a separately authorized connector and worker. An asleep or offline computer cannot execute local requests.
 
@@ -54,6 +54,6 @@ python -m unittest discover -s tests -v
 python -m pip wheel --no-deps . -w dist
 ```
 
-Offline tests have run on Windows with Python 3.11, including repeated fake-child termination checks. CI is configured to run tests and a package build on Windows and Ubuntu for supported Python versions; those hosted runs have not yet executed. No live Claude protocol fixture has yet been captured; treat the live adapter as unverified until a separately approved no-tools smoke test passes.
+Offline tests have run on Windows with Python 3.11, including repeated fake-child termination checks. CI tests and package builds passed on Windows and Ubuntu with Python 3.10–3.13. A single bounded, two-turn bridge smoke test passed on Windows: both requests completed, the second recalled the first, and the disposable Git tree stayed clean. The raw Claude stream was not retained, and tool-enabled operation is not supported.
 
 Licensed under MIT. See [CONTRIBUTING.md](CONTRIBUTING.md).
