@@ -1,0 +1,147 @@
+import argparse
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+from .adapters import ADAPTERS
+from .core import BridgeError, add_repo, add_session, check_session, claim, connect, finish, public_request, recover, redact, send
+
+
+def parser():
+    p = argparse.ArgumentParser(prog="gcb", description="Local Claude Code task bridge; JSON output, no daemon or network listener")
+    p.add_argument("--home", default=os.environ.get("GCB_HOME", str(Path.home() / ".gcb")), help="Private queue directory (default: ~/.gcb)")
+    sub = p.add_subparsers(dest="command", required=True)
+    x = sub.add_parser("repo-add", help="Allowlist an existing Git root")
+    x.add_argument("path")
+    sub.add_parser("repos", help="List allowlisted repositories")
+    x = sub.add_parser("session-add", help="Create bridge-owned session metadata; does not call a model")
+    x.add_argument("--repo", required=True)
+    x.add_argument("--name", required=True)
+    x.add_argument("--adapter", choices=ADAPTERS, default="mock")
+    sub.add_parser("sessions", help="List only bridge-owned sessions")
+    x = sub.add_parser("send", help="Queue a request and return its stable ID")
+    x.add_argument("--session", required=True)
+    x.add_argument("--source", required=True, help="Authenticated upstream actor label; local CLI trusts OS access")
+    x.add_argument("--key", required=True, help="Caller-generated stable idempotency key")
+    x.add_argument("--ttl", type=int, default=86400)
+    x.add_argument("--text", help="Prompt text, or omit to read stdin")
+    x = sub.add_parser("run-once", help="Process at most one queued request")
+    x.add_argument("--live", action="store_true", help="Permit a Claude model call")
+    x.add_argument("--budget-usd", type=float, help="Required per-turn Claude cost cap")
+    x.add_argument("--timeout", type=int, default=1800)
+    x = sub.add_parser("read", help="Read request status and final reply")
+    x.add_argument("id")
+    x.add_argument("--include-prompt", action="store_true")
+    x = sub.add_parser("watch", help="Poll a request until terminal status or timeout")
+    x.add_argument("id")
+    x.add_argument("--timeout", type=int, default=60)
+    x.add_argument("--include-prompt", action="store_true")
+    sub.add_parser("status", help="Queue counts and unknown outcomes")
+    x = sub.add_parser("audit", help="Redacted delivery event metadata")
+    x.add_argument("--limit", type=int, default=50)
+    x = sub.add_parser("resolve", help="Manually release an unknown result after inspection; no automatic replay")
+    x.add_argument("id")
+    x.add_argument("--reason", required=True)
+    x.add_argument("--session-exists", choices=("yes","no"), required=True,
+                   help="After inspecting Claude state, whether its session UUID was initialized")
+    return p
+
+
+def output(obj):
+    print(json.dumps(obj, ensure_ascii=False, sort_keys=True))
+
+
+def run(args):
+    db = connect(args.home)
+    try:
+        return _run_open(db,args)
+    finally:
+        db.close()
+
+
+def _run_open(db,args):
+    if args.command == "repo-add":
+        output(add_repo(db,args.path))
+    elif args.command == "repos":
+        output([dict(r) for r in db.execute("SELECT * FROM repos ORDER BY path")])
+    elif args.command == "session-add":
+        output(add_session(db,args.repo,args.name,args.adapter))
+    elif args.command == "sessions":
+        output([dict(r) for r in db.execute("SELECT * FROM sessions ORDER BY created_at,id")])
+    elif args.command == "send":
+        prompt = args.text if args.text is not None else sys.stdin.read(16001)
+        output(public_request(send(db,args.session,args.source,args.key,prompt,args.ttl)))
+    elif args.command == "run-once":
+        if args.timeout < 1 or args.timeout > 86400:
+            raise BridgeError("Timeout must be 1 to 86400 seconds")
+        # SQLite claim provides cross-process exclusivity. Any claimed request left
+        # after a crash is marked unknown only when no active worker owns the lock.
+        from .lock import worker_lock
+        with worker_lock(Path(args.home)):
+            recover(db)
+            upcoming = db.execute("SELECT s.adapter FROM requests q JOIN sessions s ON s.id=q.session_id WHERE q.state='queued' AND q.expires_at>? AND NOT EXISTS (SELECT 1 FROM requests x WHERE x.session_id=q.session_id AND x.state IN ('running','unknown')) ORDER BY q.created_at,q.rowid LIMIT 1",(int(time.time()),)).fetchone()
+            if upcoming and upcoming["adapter"] == "claude":
+                if not args.live or args.budget_usd is None or not (0 < args.budget_usd <= 20):
+                    raise BridgeError("Claude request remains queued: pass --live and --budget-usd in (0, 20]")
+            row = claim(db)
+            if not row:
+                output({"processed":False})
+                return
+            try:
+                session = check_session(db,row["session_id"])
+                state, reply, error, initialized = ADAPTERS[session["adapter"]](session,row,args.timeout,args.budget_usd)
+                finish(db,row["id"],state,reply,error,launched=initialized)
+            except BridgeError as exc:
+                finish(db,row["id"],"blocked",error=str(exc))
+            except Exception as exc:
+                finish(db,row["id"],"unknown",error=f"Unhandled adapter error: {type(exc).__name__}")
+            result = db.execute("SELECT * FROM requests WHERE id=?",(row["id"],)).fetchone()
+            output({"processed":True,**public_request(result)})
+    elif args.command in ("read","watch"):
+        deadline = time.monotonic() + args.timeout if args.command == "watch" else 0
+        while True:
+            row = db.execute("SELECT * FROM requests WHERE id=?",(args.id,)).fetchone()
+            if not row:
+                raise BridgeError("Unknown request")
+            if args.command == "read" or row["state"] in ("completed","blocked","failed","unknown","expired") or time.monotonic() >= deadline:
+                output(public_request(row,include_text=args.include_prompt))
+                return
+            time.sleep(0.5)
+    elif args.command == "status":
+        output({"counts":{r["state"]:r["n"] for r in db.execute("SELECT state,count(*) n FROM requests GROUP BY state")},
+                "sessions":db.execute("SELECT count(*) FROM sessions").fetchone()[0]})
+    elif args.command == "audit":
+        output([dict(r) for r in db.execute("SELECT * FROM audit ORDER BY rowid DESC LIMIT ?",(max(1,min(args.limit,500)),))])
+    elif args.command == "resolve":
+        if len(args.reason) < 10 or len(args.reason) > 200:
+            raise BridgeError("Resolution reason must be 10 to 200 characters")
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            row = db.execute("SELECT * FROM requests WHERE id=?",(args.id,)).fetchone()
+            if not row or row["state"] != "unknown":
+                raise BridgeError("Only unknown requests can be resolved")
+            db.execute("UPDATE requests SET state='resolved',error=? WHERE id=?",(args.reason,args.id))
+            if args.session_exists == "yes":
+                db.execute("UPDATE sessions SET last_completed=? WHERE id=?",(int(time.time()),row["session_id"]))
+            from .core import audit
+            audit(db,args.id,"resolved","operator inspection recorded")
+            db.execute("COMMIT")
+        except Exception:
+            db.execute("ROLLBACK")
+            raise
+        output({"id":args.id,"state":"resolved"})
+
+
+def main():
+    args = parser().parse_args()
+    try:
+        run(args)
+    except (BridgeError, ValueError, OSError) as exc:
+        print(json.dumps({"error":str(exc),"type":type(exc).__name__}),file=sys.stderr)
+        raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    main()
