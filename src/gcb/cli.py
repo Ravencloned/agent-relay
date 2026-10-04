@@ -125,6 +125,8 @@ def _run_open(db,args):
             db.execute("UPDATE requests SET state='resolved',error=? WHERE id=?",(args.reason,args.id))
             if args.session_exists == "yes":
                 db.execute("UPDATE sessions SET last_completed=? WHERE id=?",(int(time.time()),row["session_id"]))
+            else:
+                db.execute("UPDATE sessions SET last_completed=NULL WHERE id=?",(row["session_id"],))
             from .core import audit
             audit(db,args.id,"resolved","operator inspection recorded")
             db.execute("COMMIT")

@@ -116,6 +116,26 @@ class BridgeTests(unittest.TestCase):
         recover(self.db)
         self.assertIsNone(self.db.execute("SELECT last_completed FROM sessions WHERE id=?",(self.s["id"],)).fetchone()[0])
 
+    def test_resolve_no_clears_previous_resume_marker(self):
+        first=send(self.db,self.s["id"],"phone","first","hello")
+        claim(self.db)
+        finish(self.db,first["id"],"completed","ok",launched=True)
+        self.assertIsNotNone(self.db.execute("SELECT last_completed FROM sessions WHERE id=?",(self.s["id"],)).fetchone()[0])
+        second=send(self.db,self.s["id"],"phone","second","next")
+        claim(self.db)
+        finish(self.db,second["id"],"unknown",error="lost")
+        args=parser().parse_args(["--home",str(self.root / "queue"),"resolve",second["id"],
+                                  "--session-exists","no","--reason","Checked and session absent"])
+        with redirect_stdout(io.StringIO()):
+            run(args)
+        self.assertIsNone(self.db.execute("SELECT last_completed FROM sessions WHERE id=?",(self.s["id"],)).fetchone()[0])
+        s=dict(check_session(self.db,self.s["id"]))
+        s["adapter"]="claude"
+        with patch("gcb.adapters.shutil.which",return_value="claude"), patch("gcb.adapters._capture",return_value=(-1,b"",b"","timeout")) as capture:
+            adapters.claude_send(s,{"prompt":"third"},1,0.05)
+        self.assertIn("--session-id",capture.call_args.args[0])
+        self.assertNotIn("--resume",capture.call_args.args[0])
+
     def test_live_flag_error_keeps_request_queued_and_watch_hides_prompt(self):
         s=add_session(self.db,self.r["id"],"future","claude")
         q=send(self.db,s["id"],"phone","live-1","token=TOPSECRET")
@@ -163,24 +183,60 @@ class BridgeTests(unittest.TestCase):
 
     def test_output_limit_terminates_fake_child(self):
         parent=self.root / "fake_parent.py"
-        pidfile=self.root / "child.pid"
         parent.write_text("import subprocess,sys,time\n"
                           "import tempfile\n"
                           "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'],cwd=tempfile.gettempdir(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n"
                           "open(sys.argv[1],'w').write(str(p.pid))\n"
                           "sys.stdout.write('x'*2000000);sys.stdout.flush();time.sleep(30)\n")
-        with patch.object(adapters,"MAX_STDOUT",20000):
-            code,out,err,reason=adapters._capture([sys.executable,str(parent),str(pidfile)],"",str(self.repo),10)
-        self.assertEqual(reason,"output_limit",(code,len(out),err[:300]))
-        self.assertLessEqual(len(out),20000)
-        if os.name == "nt" and pidfile.exists():
-            pid=pidfile.read_text().strip()
-            for _ in range(20):
-                check=subprocess.run(["tasklist","/FI",f"PID eq {pid}"],capture_output=True,text=True)
-                if pid not in check.stdout:
-                    break
-                time.sleep(0.1)
-            self.assertNotIn(pid,check.stdout)
+        for i in range(3):
+            pidfile=self.root / f"child-overflow-{i}.pid"
+            with patch.object(adapters,"MAX_STDOUT",20000):
+                code,out,err,reason=adapters._capture([sys.executable,str(parent),str(pidfile)],"",str(self.repo),10)
+            self.assertEqual(reason,"output_limit",(code,len(out),err[:300]))
+            self.assertLessEqual(len(out),20000)
+            self.assertTrue(pidfile.exists())
+            self.assert_child_gone(pidfile)
+
+    def test_timeout_terminates_fake_child(self):
+        parent=self.root / "fake_timeout_parent.py"
+        parent.write_text("import subprocess,sys,time,tempfile\n"
+                          "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'],cwd=tempfile.gettempdir(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n"
+                          "open(sys.argv[1],'w').write(str(p.pid))\n"
+                          "time.sleep(30)\n")
+        for i in range(3):
+            pidfile=self.root / f"child-timeout-{i}.pid"
+            code,out,err,reason=adapters._capture([sys.executable,str(parent),str(pidfile)],"",str(self.repo),0.5)
+            self.assertEqual(reason,"timeout",(code,err[:300]))
+            self.assertTrue(pidfile.exists())
+            self.assert_child_gone(pidfile)
+
+    def assert_child_gone(self,pidfile):
+        if os.name != "nt":
+            return
+        import ctypes
+        from ctypes import wintypes
+        pid=int(pidfile.read_text().strip())
+        kernel=ctypes.WinDLL("kernel32",use_last_error=True)
+        kernel.OpenProcess.argtypes=(wintypes.DWORD,wintypes.BOOL,wintypes.DWORD)
+        kernel.OpenProcess.restype=wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes=(wintypes.HANDLE,ctypes.POINTER(wintypes.DWORD))
+        kernel.GetExitCodeProcess.restype=wintypes.BOOL
+        kernel.CloseHandle.argtypes=(wintypes.HANDLE,)
+        for _ in range(20):
+            handle=kernel.OpenProcess(0x1000,False,pid)
+            if not handle and ctypes.get_last_error()==87:
+                break
+            self.assertTrue(handle,ctypes.get_last_error())
+            code=wintypes.DWORD()
+            try:
+                self.assertTrue(kernel.GetExitCodeProcess(handle,ctypes.byref(code)))
+            finally:
+                kernel.CloseHandle(handle)
+            if code.value != 259:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail(f"Child {pid} is still active")
 
 
 if __name__ == "__main__":

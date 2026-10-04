@@ -31,9 +31,9 @@ Claude output is untrusted data. Do not treat its reply or tool output as a comm
 
 The queue is SQLite under `~/.gcb` by default, or `GCB_HOME` / `--home`. On Unix the directory must be mode `0700`; on Windows the CLI verifies its ACL and refuses broad read/write access. It does not modify an existing ACL. Protect backups of this directory too. Avoid shared, synchronized, or repository folders for queue state. The `.gcb/` directory is Git ignored for convenience, but ignoring a file is not an access control measure.
 
-The queue admits at most 32 pending requests; prompts are limited to 16 KB and expire after 24 hours by default. A single local worker lock and SQLite transaction prevent ordinary duplicate claims. After a crash, timeout, protocol ambiguity, or output limit, a request is `unknown` and its session is paused. Inspect the local Claude session and repository before `gcb resolve REQUEST_ID --session-exists yes|no --reason 'inspection notes'`. Resolution does **not** replay the request. Choose `yes` only if Claude initialized that UUID; the next turn then resumes it. A deliberate retry needs a new key. Exactly-once Claude execution cannot be guaranteed across failures.
+The queue admits at most 32 pending requests; prompts are limited to 16 KB and expire after 24 hours by default. A single local worker lock and SQLite transaction prevent ordinary duplicate claims. After a crash, timeout, protocol ambiguity, or output limit, a request is `unknown` and its session is paused. Inspect the local Claude session and repository before `gcb resolve REQUEST_ID --session-exists yes|no --reason 'inspection notes'`. Resolution does **not** replay the request. Choose `yes` only if Claude initialized that UUID; the next turn then resumes it. `no` clears the resume marker, so the next turn starts under that UUID. A deliberate retry needs a new key. Exactly-once Claude execution cannot be guaranteed across failures.
 
-One `run-once` call processes at most one request. Stop by ceasing to call it; no service is installed. Stdout is capped at 1 MB during reading, stderr at 16 KB, and the process tree is terminated on timeout or overflow. The process-tree cleanup uses `taskkill /T` on Windows and a process group on Unix; externally detached children may survive. No remote network or credential setup is part of this project.
+One `run-once` call processes at most one request. Stop by ceasing to call it; no service is installed. Stdout is capped at 1 MB during reading and stderr at 16 KB. On Windows, the child starts suspended, joins a kill-on-close Job Object, and only then runs. This terminated fake child processes in repeated local timeout and overflow tests. On Unix, the adapter uses a process group. An independently detached Unix process could survive. No remote network or credential setup is part of this project.
 
 ## Architecture and boundaries
 
@@ -54,6 +54,6 @@ python -m unittest discover -s tests -v
 python -m pip wheel --no-deps . -w dist
 ```
 
-Offline tests have run on Windows with Python 3.11. CI runs tests and a package build on Windows and Ubuntu for supported Python versions. No live Claude protocol fixture has yet been captured; treat the live adapter as unverified until a separately approved no-tools smoke test passes.
+Offline tests have run on Windows with Python 3.11, including repeated fake-child termination checks. CI is configured to run tests and a package build on Windows and Ubuntu for supported Python versions; those hosted runs have not yet executed. No live Claude protocol fixture has yet been captured; treat the live adapter as unverified until a separately approved no-tools smoke test passes.
 
 Licensed under MIT. See [CONTRIBUTING.md](CONTRIBUTING.md).

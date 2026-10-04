@@ -24,14 +24,9 @@ def mock_send(session, request, timeout, budget):
 
 def _kill_tree(proc):
     if os.name == "nt":
-        try:
-            result = subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-            if result.returncode and proc.poll() is None:
-                proc.kill()
-        except (OSError, subprocess.TimeoutExpired):
-            if proc.poll() is None:
-                proc.kill()
+        # On Windows the job handle is closed by _capture before this wait.
+        if proc.poll() is None:
+            proc.kill()
     else:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -46,10 +41,13 @@ def _kill_tree(proc):
 
 def _capture(args, prompt, cwd, timeout):
     """Bound both pipes during the run, and stop the process tree on limits."""
-    flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-    proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, cwd=cwd, creationflags=flags,
-                            start_new_session=(os.name != "nt"))
+    job = None
+    if os.name == "nt":
+        from .winjob import spawn
+        proc, job = spawn(args,cwd)
+    else:
+        proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, cwd=cwd,start_new_session=True)
     out, err = bytearray(), bytearray()
     over = threading.Event()
 
@@ -84,22 +82,32 @@ def _capture(args, prompt, cwd, timeout):
     while proc.poll() is None or any(t.is_alive() for t in readers):
         if over.is_set():
             reason = "output_limit"
+            if job:
+                job.close()
             _kill_tree(proc)
             break
         if time.monotonic() >= deadline:
             reason = "timeout"
+            if job:
+                job.close()
             _kill_tree(proc)
             break
         over.wait(0.001)
     if over.is_set() and reason is None:
         reason = "output_limit"
+        if job:
+            job.close()
         _kill_tree(proc)
     for t in readers:
         t.join(timeout=2)
     writer.join(timeout=2)
     if any(t.is_alive() for t in readers) or writer.is_alive():
         reason = reason or "pipe_stalled"
+        if job:
+            job.close()
         _kill_tree(proc)
+    if job:
+        job.close()
     return proc.returncode, bytes(out), bytes(err), reason
 
 
