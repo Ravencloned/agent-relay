@@ -78,8 +78,9 @@ def canonical(path):
 
 def git_identity(path):
     p = canonical(path)
+    from .gitops import run as safe_git
     def git(*args):
-        r = subprocess.run(["git", "-C", p, *args], capture_output=True, text=True, timeout=10)
+        r = safe_git(p,*args,text=True)
         if r.returncode:
             raise BridgeError("Repository must be an existing Git working tree")
         return canonical(r.stdout.strip())
@@ -114,6 +115,14 @@ def connect(home):
             UNIQUE(source,key));
         CREATE TABLE IF NOT EXISTS audit (at INTEGER NOT NULL, request_id TEXT, event TEXT NOT NULL,
             detail TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS patch_scopes (session_id TEXT PRIMARY KEY REFERENCES sessions(id),
+            branch TEXT NOT NULL, head TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS patch_files (request_id TEXT NOT NULL REFERENCES requests(id),
+            path TEXT NOT NULL, PRIMARY KEY(request_id,path));
+        CREATE TABLE IF NOT EXISTS patch_requests (request_id TEXT PRIMARY KEY REFERENCES requests(id),
+            instruction TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS patch_applied (request_id TEXT PRIMARY KEY REFERENCES requests(id),
+            digest TEXT NOT NULL, applied_at INTEGER NOT NULL, source TEXT NOT NULL);
     """)
     return db
 
@@ -133,15 +142,59 @@ def add_repo(db, path):
 
 
 def add_session(db, repo_id, name, adapter):
-    if adapter not in ("mock", "claude"):
+    if adapter not in ("mock", "claude", "claude-patch"):
         raise BridgeError("Unsupported adapter")
     if not name or len(name) > 80:
         raise BridgeError("Session name must be 1 to 80 characters")
     if not db.execute("SELECT 1 FROM repos WHERE id=?", (repo_id,)).fetchone():
         raise BridgeError("Repository is not allowlisted")
     sid = str(uuid.uuid4())
-    db.execute("INSERT INTO sessions VALUES (?,?,?,?,?,NULL)", (sid, name, repo_id, adapter, int(time.time())))
+    if adapter == "claude-patch":
+        path = db.execute("SELECT path FROM repos WHERE id=?",(repo_id,)).fetchone()[0]
+        from .gitops import run as safe_git
+        common = safe_git(path,"rev-parse","--path-format=absolute","--git-common-dir",text=True)
+        git_dir = db.execute("SELECT git_dir FROM repos WHERE id=?",(repo_id,)).fetchone()[0]
+        if common.returncode or os.path.normcase(canonical(common.stdout.strip())) == os.path.normcase(git_dir):
+            raise BridgeError("Patch mode requires a separate linked Git worktree")
+        branch, head = patch_checkpoint(path)
+        require_clean(path)
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        db.execute("INSERT INTO sessions VALUES (?,?,?,?,?,NULL)", (sid, name, repo_id, adapter, int(time.time())))
+        if adapter == "claude-patch":
+            db.execute("INSERT INTO patch_scopes VALUES (?,?,?)",(sid,branch,head))
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
     return dict(db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone())
+
+
+def patch_checkpoint(path):
+    from .gitops import run as safe_git
+    branch = safe_git(path,"symbolic-ref","--short","HEAD",text=True)
+    head = safe_git(path,"rev-parse","HEAD",text=True)
+    if branch.returncode or head.returncode or not branch.stdout.strip():
+        raise BridgeError("Patch mode requires a committed, named branch")
+    return branch.stdout.strip(), head.stdout.strip()
+
+
+def require_clean(path):
+    from .gitops import run as safe_git
+    result = safe_git(path,"status","--porcelain","--ignore-submodules=all",text=True)
+    if result.returncode or result.stdout.strip():
+        raise BridgeError("Patch mode requires a clean Git worktree under bridge Git settings")
+
+
+def check_patch_scope(db, session):
+    if session["adapter"] != "claude-patch":
+        raise BridgeError("Session is not in patch mode")
+    scope = db.execute("SELECT * FROM patch_scopes WHERE session_id=?",(session["id"],)).fetchone()
+    if not scope:
+        raise BridgeError("Patch scope is missing")
+    if patch_checkpoint(session["path"]) != (scope["branch"],scope["head"]):
+        raise BridgeError("Patch branch or base commit changed")
+    return scope
 
 
 def check_session(db, sid):
@@ -159,8 +212,23 @@ def check_session(db, sid):
     return row
 
 
-def send(db, sid, source, key, prompt, ttl=86400):
-    check_session(db, sid)
+def send(db, sid, source, key, prompt, ttl=86400, files=()):
+    session = check_session(db, sid)
+    if session["adapter"] == "claude-patch":
+        original = prompt
+        old = db.execute("SELECT * FROM requests WHERE source=? AND key=?",(source,key)).fetchone()
+        if old:
+            prior = db.execute("SELECT instruction FROM patch_requests WHERE request_id=?",(old["id"],)).fetchone()
+            prior_files = [r[0] for r in db.execute("SELECT path FROM patch_files WHERE request_id=? ORDER BY rowid",(old["id"],))]
+            if old["session_id"] != sid or not prior or prior["instruction"] != original or prior_files != list(files):
+                raise BridgeError("Idempotency key already used for a different request")
+            return dict(old)
+        from .patches import context_prompt
+        check_patch_scope(db, session)
+        require_clean(session["path"])
+        prompt, files = context_prompt(session["path"], prompt, files)
+    elif files:
+        raise BridgeError("File context requires a patch session")
     if not source or len(source) > 100 or not key or len(key) > 128:
         raise BridgeError("Source and idempotency key are required and bounded")
     if not prompt or len(prompt.encode("utf-8")) > MAX_PROMPT:
@@ -182,6 +250,10 @@ def send(db, sid, source, key, prompt, ttl=86400):
         rid = str(uuid.uuid4())
         db.execute("INSERT INTO requests (id,session_id,source,key,prompt,state,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?)",
                    (rid,sid,source,key,prompt,"queued",now,now+ttl))
+        for path in files:
+            db.execute("INSERT INTO patch_files VALUES (?,?)",(rid,path))
+        if session["adapter"] == "claude-patch":
+            db.execute("INSERT INTO patch_requests VALUES (?,?)",(rid,original))
         audit(db,rid,"queued",f"source={redact(source)}; bytes={len(prompt.encode('utf-8'))}; sha256={hashlib.sha256(prompt.encode()).hexdigest()}")
         db.execute("COMMIT")
         return dict(db.execute("SELECT * FROM requests WHERE id=?", (rid,)).fetchone())

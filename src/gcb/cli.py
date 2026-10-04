@@ -7,6 +7,7 @@ import time
 
 from .adapters import ADAPTERS
 from .core import BridgeError, add_repo, add_session, check_session, claim, connect, finish, public_request, recover, redact, send
+from .patches import apply_reviewed, review
 
 
 def parser():
@@ -27,6 +28,7 @@ def parser():
     x.add_argument("--key", required=True, help="Caller-generated stable idempotency key")
     x.add_argument("--ttl", type=int, default=86400)
     x.add_argument("--text", help="Prompt text, or omit to read stdin")
+    x.add_argument("--file", action="append", default=[], help="Tracked UTF-8 file to show Claude in patch mode; repeat")
     x = sub.add_parser("run-once", help="Process at most one queued request")
     x.add_argument("--live", action="store_true", help="Permit a Claude model call")
     x.add_argument("--budget-usd", type=float, help="Required per-turn Claude cost cap")
@@ -41,6 +43,12 @@ def parser():
     sub.add_parser("status", help="Queue counts and unknown outcomes")
     x = sub.add_parser("audit", help="Redacted delivery event metadata")
     x.add_argument("--limit", type=int, default=50)
+    x = sub.add_parser("patch-check", help="Check a completed patch against its pinned clean worktree")
+    x.add_argument("id")
+    x = sub.add_parser("patch-apply", help="Apply an exactly reviewed patch locally")
+    x.add_argument("id")
+    x.add_argument("--digest", required=True)
+    x.add_argument("--source", required=True, help="Authenticated local approver label")
     x = sub.add_parser("resolve", help="Manually release an unknown result after inspection; no automatic replay")
     x.add_argument("id")
     x.add_argument("--reason", required=True)
@@ -72,7 +80,7 @@ def _run_open(db,args):
         output([dict(r) for r in db.execute("SELECT * FROM sessions ORDER BY created_at,id")])
     elif args.command == "send":
         prompt = args.text if args.text is not None else sys.stdin.read(16001)
-        output(public_request(send(db,args.session,args.source,args.key,prompt,args.ttl)))
+        output(public_request(send(db,args.session,args.source,args.key,prompt,args.ttl,args.file)))
     elif args.command == "run-once":
         if args.timeout < 1 or args.timeout > 86400:
             raise BridgeError("Timeout must be 1 to 86400 seconds")
@@ -82,7 +90,7 @@ def _run_open(db,args):
         with worker_lock(Path(args.home)):
             recover(db)
             upcoming = db.execute("SELECT s.adapter FROM requests q JOIN sessions s ON s.id=q.session_id WHERE q.state='queued' AND q.expires_at>? AND NOT EXISTS (SELECT 1 FROM requests x WHERE x.session_id=q.session_id AND x.state IN ('running','unknown')) ORDER BY q.created_at,q.rowid LIMIT 1",(int(time.time()),)).fetchone()
-            if upcoming and upcoming["adapter"] == "claude":
+            if upcoming and upcoming["adapter"] in ("claude","claude-patch"):
                 if not args.live or args.budget_usd is None or not (0 < args.budget_usd <= 20):
                     raise BridgeError("Claude request remains queued: pass --live and --budget-usd in (0, 20]")
             row = claim(db)
@@ -91,7 +99,8 @@ def _run_open(db,args):
                 return
             try:
                 session = check_session(db,row["session_id"])
-                state, reply, error, initialized = ADAPTERS[session["adapter"]](session,row,args.timeout,args.budget_usd)
+                task = {**row,"_home":str(Path(args.home).expanduser().resolve())}
+                state, reply, error, initialized = ADAPTERS[session["adapter"]](session,task,args.timeout,args.budget_usd)
                 finish(db,row["id"],state,reply,error,launched=initialized)
             except BridgeError as exc:
                 finish(db,row["id"],"blocked",error=str(exc))
@@ -106,7 +115,11 @@ def _run_open(db,args):
             if not row:
                 raise BridgeError("Unknown request")
             if args.command == "read" or row["state"] in ("completed","blocked","failed","unknown","expired") or time.monotonic() >= deadline:
-                output(public_request(row,include_text=args.include_prompt))
+                result = public_request(row,include_text=args.include_prompt)
+                applied = db.execute("SELECT digest,applied_at,source FROM patch_applied WHERE request_id=?",(args.id,)).fetchone()
+                if applied:
+                    result["patch_applied"] = dict(applied)
+                output(result)
                 return
             time.sleep(0.5)
     elif args.command == "status":
@@ -114,6 +127,13 @@ def _run_open(db,args):
                 "sessions":db.execute("SELECT count(*) FROM sessions").fetchone()[0]})
     elif args.command == "audit":
         output([dict(r) for r in db.execute("SELECT * FROM audit ORDER BY rowid DESC LIMIT ?",(max(1,min(args.limit,500)),))])
+    elif args.command == "patch-check":
+        session, patch, digest, _expected = review(db,args.id)
+        output({"request_id":args.id,"repo_id":session["repo_id"],"digest":digest,"bytes":len(patch.encode()),"state":"ready"})
+    elif args.command == "patch-apply":
+        from .lock import worker_lock
+        with worker_lock(Path(args.home)):
+            output(apply_reviewed(db,args.id,args.digest,args.source))
     elif args.command == "resolve":
         if len(args.reason) < 10 or len(args.reason) > 200:
             raise BridgeError("Resolution reason must be 10 to 200 characters")
