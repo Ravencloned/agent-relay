@@ -89,6 +89,10 @@ def git_identity(path):
     return top, git("rev-parse", "--absolute-git-dir")
 
 
+def repo_id(top, git_dir):
+    return hashlib.sha256((os.path.normcase(top) + "\0" + os.path.normcase(git_dir)).encode()).hexdigest()[:20]
+
+
 def connect(home):
     h = Path(home).expanduser()
     created = not h.exists()
@@ -120,7 +124,7 @@ def audit(db, request_id, event, detail=""):
 
 def add_repo(db, path):
     top, git_dir = git_identity(path)
-    rid = hashlib.sha256((os.path.normcase(top) + "\0" + os.path.normcase(git_dir)).encode()).hexdigest()[:20]
+    rid = repo_id(top,git_dir)
     db.execute("INSERT OR IGNORE INTO repos VALUES (?,?,?)", (rid, top, git_dir))
     row = db.execute("SELECT * FROM repos WHERE id=?", (rid,)).fetchone()
     if row["path"] != top or row["git_dir"] != git_dir:
@@ -150,6 +154,8 @@ def check_session(db, sid):
         raise BridgeError("Repository is missing or stale") from e
     if os.path.normcase(top) != os.path.normcase(row["path"]) or os.path.normcase(gd) != os.path.normcase(row["git_dir"]):
         raise BridgeError("Repository identity changed")
+    if repo_id(top,gd) != row["repo_id"]:
+        raise BridgeError("Repository allowlist identity changed")
     return row
 
 
