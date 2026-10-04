@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 
-from .core import BridgeError, git_identity
+from .core import BridgeError, git_identity, check_patch_scope, connect, require_clean
 
 
 MAX_STDOUT = 1_000_000
@@ -207,4 +207,17 @@ def claude_send(session, request, timeout, budget):
     return "completed", reply, "", initialized
 
 
-ADAPTERS = {"mock": mock_send, "claude": claude_send}
+def claude_patch_send(session, request, timeout, budget):
+    home = request.get("_home")
+    if not home:
+        raise BridgeError("Patch adapter requires a private queue home")
+    db = connect(home)
+    try:
+        check_patch_scope(db, session)
+        require_clean(session["path"])
+    finally:
+        db.close()
+    return claude_send(session, request, timeout, budget)
+
+
+ADAPTERS = {"mock": mock_send, "claude": claude_send, "claude-patch": claude_patch_send}

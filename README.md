@@ -23,7 +23,29 @@ gcb read $request
 
 `gcb session-add --repo REPO_ID --name trial --adapter claude` creates metadata and a fresh UUID; it does not call Claude. To process its request, `gcb run-once --live --budget-usd 0.05 --timeout 60` requires an explicit per-turn cost cap. Missing live flags or budget leave the request queued. Check your Claude account, selected provider/model, billing terms, settings, and the allowed repository before a real call. The CLI uses whichever account/provider your local Claude Code selects. `--max-budget-usd` is a Claude Code estimate for **one invocation**, not an account spending limit. No paid calls were made during development or tests.
 
-The current adapter deliberately starts Claude Code with `--safe-mode --strict-mcp-config --tools "" --permission-mode dontAsk --permission-prompts none`. It provides **conversation only**: Claude cannot read or edit the repository through tools. Safe mode suppresses custom hooks, plugins, and settings, while managed policy still applies. The bridge rejects a stream whose initialization event does not confirm an empty tool list. It has no remote permission approval channel. A future coding adapter requires a reviewed permission design; do not remove these flags casually.
+The `claude` adapter starts Claude Code with `--safe-mode --strict-mcp-config --tools "" --permission-mode dontAsk --permission-prompts none`. It provides **conversation only**: Claude cannot read or edit the repository through tools. Safe mode suppresses custom hooks, plugins, and settings, while managed policy still applies. The bridge rejects a stream whose initialization event does not confirm an empty tool list.
+
+## Reviewed patch mode (offline tested)
+
+`claude-patch` is a limited coding workflow. Claude receives selected tracked UTF-8 files as text and proposes a unified diff. It has **no Claude tools**. The bridge validates that the diff changes only those files and applies it locally only after a person reviews the reply and supplies its exact digest. This avoids relying on a Claude hook to enforce file permissions: [Claude's hook reference](https://code.claude.com/docs/en/hooks) says hook startup errors and timeouts can be nonblocking. It does not provide an interactive Claude coding terminal, arbitrary commands, or autonomous test execution.
+
+At a safe checkpoint, make a separate clean worktree on a named branch. Do not use a worktree occupied by an existing Claude process:
+
+```powershell
+git -C 'C:\path\to\project' worktree add -b bridge-work 'C:\path\to\bridge-work' HEAD
+$repo = (gcb repo-add 'C:\path\to\bridge-work' | ConvertFrom-Json).id
+$session = (gcb session-add --repo $repo --name patch-work --adapter claude-patch | ConvertFrom-Json).id
+$request = (gcb send --session $session --source local-user --key unique-event-002 --file src/example.py --text 'Make the requested change.' | ConvertFrom-Json).id
+gcb run-once --live --budget-usd 0.05 --timeout 300
+gcb read $request
+gcb patch-check $request
+```
+
+`gcb read` shows the full proposed patch. Inspect it and the target files. `patch-check` returns the SHA-256 digest and confirms that the patch applies to the pinned clean worktree. To approve that exact proposal, run `gcb patch-apply $request --digest REVIEWED_SHA256 --source local-user`. The source is an attribution label from a trusted local caller, not proof of identity. A denied proposal needs no action; it never reaches the filesystem. `patch-apply` stages the approved change in the separate worktree. Run tests or commit it through your normal reviewed local workflow. A changed branch, commit, dirty worktree, changed patch, unselected path, symlink, hard link, or protected `.env*` path blocks application.
+
+All bridge Git commands ignore inherited `GIT_*` environment overrides, global and system Git config, executable local filter and diff driver settings, and configured filesystem monitors. Selected files with Git attributes are refused. Git patch whitespace behavior is pinned; before application the bridge applies the patch to disposable file copies, then checks that both staged and working bytes match those reviewed results. CRLF patches that Git cannot apply are refused. A crash after Git applies a patch but before recording success leaves a dirty worktree and blocks automatic retry; inspect it manually. These checks do not isolate the worktree from another local process that can modify it concurrently.
+
+One patch request can include 1–12 explicitly selected tracked files, up to 12 KB total context. Their contents and the instruction are stored in the private queue; select files without secrets. This deliberately limits the size of changes Claude can propose. For a second change after applying a patch, review and commit the worktree, then register a new patch session at that checkpoint. The patch adapter has passed offline fixture tests only. No live coding call has been made, and model output quality remains unverified. It uses the same opt-in `--live --budget-usd` guard as the conversation adapter.
 
 Claude output is untrusted data. Do not treat its reply or tool output as a command to Groot. Only a final JSON result with the expected session UUID and working directory is accepted. Known key/token shapes are redacted heuristically from stored replies and CLI output; **arbitrary secrets cannot be reliably detected**. Do not put secrets in prompts. The private queue database holds the original prompt until manually removed. `read` and `watch` omit the prompt unless `--include-prompt` is passed.
 
@@ -54,6 +76,6 @@ python -m unittest discover -s tests -v
 python -m pip wheel --no-deps . -w dist
 ```
 
-Offline tests have run on Windows with Python 3.11, including repeated fake-child termination checks. CI tests and package builds passed on Windows and Ubuntu with Python 3.10–3.13. A single bounded, two-turn bridge smoke test passed on Windows: both requests completed, the second recalled the first, and the disposable Git tree stayed clean. The raw Claude stream was not retained, and tool-enabled operation is not supported.
+Offline tests have run on Windows with Python 3.11, including repeated fake-child termination and adversarial patch checks. CI tests and package builds passed on Windows and Ubuntu with Python 3.10–3.13 for the conversation-only release. A single bounded, two-turn conversation smoke test passed on Windows: both requests completed, the second recalled the first, and the disposable Git tree stayed clean. The raw Claude stream was not retained. Patch mode has not yet had a live model test.
 
 Licensed under MIT. See [CONTRIBUTING.md](CONTRIBUTING.md).
