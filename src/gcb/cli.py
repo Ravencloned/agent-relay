@@ -9,6 +9,7 @@ from .adapters import ADAPTERS
 from .core import BridgeError, add_repo, add_session, check_session, claim, connect, finish, public_request, recover, redact, send
 from .patches import apply_reviewed, review
 from .targets import check_target, discover, public_target
+from . import channel_queue
 
 
 def parser():
@@ -20,6 +21,25 @@ def parser():
     x = sub.add_parser("target-check", help="Verify exact Claude session and repository path; never sends a message")
     x.add_argument("--session", required=True)
     x.add_argument("--repo", required=True)
+    x = sub.add_parser("channel-register", help="Register a discovered Claude target; does not enable or contact its channel")
+    x.add_argument("--session",required=True)
+    x.add_argument("--repo",required=True,help="Allowlisted repository ID")
+    x = sub.add_parser("channel-send", help="Queue a message for an already bound channel")
+    x.add_argument("--session",required=True)
+    x.add_argument("--source",required=True)
+    x.add_argument("--key",required=True)
+    x.add_argument("--ttl",type=int,default=86400)
+    x.add_argument("--text",help="Message text, or omit to read stdin")
+    x = sub.add_parser("channel-read", help="Read channel delivery state and reply")
+    x.add_argument("id")
+    x.add_argument("--include-prompt",action="store_true")
+    x = sub.add_parser("channel-watch", help="Poll a channel message until completed or timeout")
+    x.add_argument("id")
+    x.add_argument("--timeout",type=int,default=60)
+    x = sub.add_parser("channel-resolve",help="Release an unknown channel outcome after manual inspection")
+    x.add_argument("id")
+    x.add_argument("--reason",required=True)
+    sub.add_parser("channel-status",help="List registered channel targets and queue counts")
     x = sub.add_parser("repo-add", help="Allowlist an existing Git root")
     x.add_argument("path")
     sub.add_parser("repos", help="List allowlisted repositories")
@@ -82,7 +102,28 @@ def run(args):
 
 
 def _run_open(db,args):
-    if args.command == "repo-add":
+    if args.command == "channel-register":
+        output(channel_queue.register(db,args.session,args.repo))
+    elif args.command == "channel-send":
+        prompt = args.text if args.text is not None else sys.stdin.read(16001)
+        output(channel_queue.send(db,args.session,args.source,args.key,prompt,args.ttl))
+    elif args.command in ("channel-read","channel-watch"):
+        deadline = time.monotonic() + args.timeout if args.command == "channel-watch" else 0
+        while True:
+            row = db.execute("SELECT * FROM channel_requests WHERE id=?",(args.id,)).fetchone()
+            if not row:
+                raise BridgeError("Unknown channel request")
+            if args.command == "channel-read" or row["state"] in ("completed","unknown","expired","resolved") or time.monotonic() >= deadline:
+                output(channel_queue.public_request(row,include_text=getattr(args,"include_prompt",False)))
+                return
+            time.sleep(0.5)
+    elif args.command == "channel-resolve":
+        output(channel_queue.resolve(db,args.id,args.reason))
+    elif args.command == "channel-status":
+        output({"targets":[{"session_id":r["session_id"],"repo_id":r["repo_id"],"bound":bool(r["bound_nonce"]),"bound_pid":r["bound_pid"]}
+                           for r in db.execute("SELECT * FROM channel_targets ORDER BY created_at")],
+                "counts":{r["state"]:r["n"] for r in db.execute("SELECT state,count(*) n FROM channel_requests GROUP BY state")}})
+    elif args.command == "repo-add":
         output(add_repo(db,args.path))
     elif args.command == "repos":
         output([dict(r) for r in db.execute("SELECT * FROM repos ORDER BY path")])

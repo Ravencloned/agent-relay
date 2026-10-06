@@ -123,6 +123,15 @@ def connect(home):
             instruction TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS patch_applied (request_id TEXT PRIMARY KEY REFERENCES requests(id),
             digest TEXT NOT NULL, applied_at INTEGER NOT NULL, source TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS channel_targets (session_id TEXT PRIMARY KEY,
+            repo_id TEXT NOT NULL REFERENCES repos(id), created_at INTEGER NOT NULL,
+            bound_pid INTEGER, bound_nonce TEXT, bound_at INTEGER);
+        CREATE TABLE IF NOT EXISTS channel_requests (id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES channel_targets(session_id),
+            source TEXT NOT NULL, key TEXT NOT NULL, prompt TEXT NOT NULL,
+            state TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+            sent_at INTEGER, finished_at INTEGER, reply TEXT, error TEXT,
+            UNIQUE(source,key));
     """)
     return db
 

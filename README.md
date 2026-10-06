@@ -25,6 +25,12 @@ gcb read $request
 
 Claude's [CLI reference](https://code.claude.com/docs/en/cli-reference) documents message routing to running background sessions. Its [channels](https://code.claude.com/docs/en/channels) can inject events into an opted-in running session and provide a reply tool, including when the session stays open in a terminal. A session launched without the channel must be deliberately restarted with it at a safe checkpoint; discovery alone does not enable that path.
 
+## Channel queue protocol (adapter activation pending)
+
+The channel queue binds a registered session UUID, exact Git root, and Claude PID before it accepts messages. `channel-register --session UUID --repo REPO_ID` records that intended target without contacting it. An opted-in channel process binds itself and receives a short-lived private nonce; `channel-send --session UUID --source ACTOR --key EVENT_ID --text MESSAGE` then queues an idempotent message. `channel-read ID` and `channel-watch ID` show its state and reply. These CLI commands do not install or start a channel.
+
+The states distinguish `queued`, `dispatching`, `emitted`, `completed`, and `unknown`. `emitted` means only that the MCP notification was written to Claude's transport. [Claude does not acknowledge channel notifications](https://code.claude.com/docs/en/channels-reference), so it is **not** proof that the model read the message. `completed` requires a matching call to the channel reply tool. On restart, any message that might have been delivered becomes `unknown`; later messages stay blocked until `channel-resolve ID --reason 'inspection notes'`. The bridge never silently resends an ambiguous request. The channel has no remote permission relay capability, so messages cannot approve Claude's file or command prompts.
+
 ## Opt-in Claude transport
 
 `gcb session-add --repo REPO_ID --name trial --adapter claude` creates metadata and a fresh UUID; it does not call Claude. To process its request, `gcb run-once --live --budget-usd 0.05 --timeout 60` requires an explicit per-turn cost cap. Missing live flags or budget leave the request queued. Check your Claude account, selected provider/model, billing terms, settings, and the allowed repository before a real call. The CLI uses whichever account/provider your local Claude Code selects. `--max-budget-usd` is a Claude Code estimate for **one invocation**, not an account spending limit. No paid calls were made during development or tests.
