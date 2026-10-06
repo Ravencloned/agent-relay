@@ -45,7 +45,7 @@ def bind(db, session_id, parent_pid):
         for item in pending:
             db.execute("UPDATE channel_requests SET state='unknown',finished_at=?,error='Channel restarted after dispatch; delivery may have occurred' WHERE id=?",(now,item["id"]))
             audit(db,item["id"],"channel_unknown","binding restarted")
-        db.execute("UPDATE channel_targets SET bound_pid=?,bound_nonce=?,bound_at=? WHERE session_id=?",(parent_pid,nonce,now,session_id))
+        db.execute("UPDATE channel_targets SET bound_pid=?,bound_nonce=?,bound_at=?,last_seen_at=NULL WHERE session_id=?",(parent_pid,nonce,now,session_id))
         audit(db,None,"channel_bound",f"session_id={session_id}; pid={parent_pid}")
         db.execute("COMMIT")
     except Exception:
@@ -79,8 +79,8 @@ def send(db, session_id, source, key, prompt, ttl=86400):
                 raise BridgeError("Idempotency key already used for a different channel request")
             db.execute("COMMIT")
             return public_request(old)
-        if not row["bound_nonce"]:
-            raise BridgeError("Channel target has not opted in and bound")
+        if not row["bound_nonce"] or not row["last_seen_at"] or now-row["last_seen_at"] > 15:
+            raise BridgeError("Channel target is not actively polling")
         target = check_target(session_id,row["path"])
         if target["pid"] != row["bound_pid"]:
             raise BridgeError("Channel target process changed; rebind at a checkpoint")
@@ -103,6 +103,7 @@ def next_request(db, session_id, nonce):
     db.execute("BEGIN IMMEDIATE")
     try:
         _bound(db,session_id,nonce)
+        db.execute("UPDATE channel_targets SET last_seen_at=? WHERE session_id=?",(now,session_id))
         for item in db.execute("SELECT id FROM channel_requests WHERE session_id=? AND state='queued' AND expires_at<=?",(session_id,now)):
             db.execute("UPDATE channel_requests SET state='expired',finished_at=? WHERE id=?",(now,item["id"]))
             audit(db,item["id"],"channel_expired")

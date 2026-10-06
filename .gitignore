@@ -1,4 +1,6 @@
 .gcb/
+.npm-cache/
+channel/node_modules/
 __pycache__/
 *.pyc
 *.egg-info/

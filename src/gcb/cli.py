@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import time
 
@@ -40,6 +41,8 @@ def parser():
     x.add_argument("id")
     x.add_argument("--reason",required=True)
     sub.add_parser("channel-status",help="List registered channel targets and queue counts")
+    x = sub.add_parser("channel-config",help="Print a reviewable Claude MCP config fragment; does not install it")
+    x.add_argument("--session",required=True)
     x = sub.add_parser("repo-add", help="Allowlist an existing Git root")
     x.add_argument("path")
     sub.add_parser("repos", help="List allowlisted repositories")
@@ -120,9 +123,21 @@ def _run_open(db,args):
     elif args.command == "channel-resolve":
         output(channel_queue.resolve(db,args.id,args.reason))
     elif args.command == "channel-status":
-        output({"targets":[{"session_id":r["session_id"],"repo_id":r["repo_id"],"bound":bool(r["bound_nonce"]),"bound_pid":r["bound_pid"]}
+        output({"targets":[{"session_id":r["session_id"],"repo_id":r["repo_id"],"bound":bool(r["bound_nonce"]),
+                            "healthy":bool(r["last_seen_at"] and int(time.time())-r["last_seen_at"]<=15),"bound_pid":r["bound_pid"]}
                            for r in db.execute("SELECT * FROM channel_targets ORDER BY created_at")],
                 "counts":{r["state"]:r["n"] for r in db.execute("SELECT state,count(*) n FROM channel_requests GROUP BY state")}})
+    elif args.command == "channel-config":
+        if not db.execute("SELECT 1 FROM channel_targets WHERE session_id=?",(args.session,)).fetchone():
+            raise BridgeError("Register the channel target first")
+        node = shutil.which("node")
+        root = Path(__file__).resolve().parents[2]
+        server = root / "channel" / "server.mjs"
+        if not node or not server.is_file() or not (root / "channel" / "node_modules" / "@modelcontextprotocol" / "sdk").exists():
+            raise BridgeError("Install the pinned channel dependencies before generating config")
+        output({"mcpServers":{"agent-relay":{"command":str(Path(node).resolve()),"args":[str(server)],
+                "env":{"GCB_PYTHON":str(Path(sys.executable).resolve()),"GCB_SOURCE_DIR":str(root / "src"),
+                       "GCB_HOME":str(Path(args.home).expanduser().resolve()),"GCB_SESSION_ID":args.session}}}})
     elif args.command == "repo-add":
         output(add_repo(db,args.path))
     elif args.command == "repos":

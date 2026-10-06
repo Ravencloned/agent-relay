@@ -36,7 +36,9 @@ class ChannelQueueTests(unittest.TestCase):
         channel_queue.register(self.db,SID,self.rid)
 
     def bind(self):
-        return channel_queue.bind(self.db,SID,12345)["nonce"]
+        nonce = channel_queue.bind(self.db,SID,12345)["nonce"]
+        channel_queue.next_request(self.db,SID,nonce)
+        return nonce
 
     def test_no_delivery_until_bound_and_exact_reply(self):
         with self.assertRaises(BridgeError):

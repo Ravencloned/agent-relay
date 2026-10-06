@@ -125,7 +125,7 @@ def connect(home):
             digest TEXT NOT NULL, applied_at INTEGER NOT NULL, source TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS channel_targets (session_id TEXT PRIMARY KEY,
             repo_id TEXT NOT NULL REFERENCES repos(id), created_at INTEGER NOT NULL,
-            bound_pid INTEGER, bound_nonce TEXT, bound_at INTEGER);
+            bound_pid INTEGER, bound_nonce TEXT, bound_at INTEGER, last_seen_at INTEGER);
         CREATE TABLE IF NOT EXISTS channel_requests (id TEXT PRIMARY KEY,
             session_id TEXT NOT NULL REFERENCES channel_targets(session_id),
             source TEXT NOT NULL, key TEXT NOT NULL, prompt TEXT NOT NULL,

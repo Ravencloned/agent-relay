@@ -1,6 +1,6 @@
 # Agent Relay
 
-**Alpha.** A local, opt-in command line queue for a caller such as Groot to send one turn at a time to a **new, bridge-owned** Claude Code session. It cannot attach to an arbitrary running terminal session. A two-turn, no-tools Claude smoke test passed on Windows with an existing Claude login; broader live use is unverified. No daemon, network listener, tunnel, telemetry, credentials, or autostart is installed.
+**Alpha.** A local, opt-in command line queue for a caller such as Groot. The default transport talks one turn at a time to a **new, bridge-owned** Claude Code session. An experimental MCP channel can reach an existing conversation only after that session is deliberately resumed with the channel enabled; it cannot attach to or inject into an arbitrary running terminal. A two-turn, no-tools Claude smoke test passed on Windows; live channel behavior remains unverified. No daemon, network listener, tunnel, telemetry, credentials, or autostart is installed by this project.
 
 If an authorized Groot task can already run local commands on an online computer, it can invoke this CLI directly. That attended phone → Groot → local CLI path needs no additional HTTP service. Unattended event delivery while no local task is running would need a separately authorized connector and worker. An asleep or offline computer cannot execute local requests.
 
@@ -25,11 +25,43 @@ gcb read $request
 
 Claude's [CLI reference](https://code.claude.com/docs/en/cli-reference) documents message routing to running background sessions. Its [channels](https://code.claude.com/docs/en/channels) can inject events into an opted-in running session and provide a reply tool, including when the session stays open in a terminal. A session launched without the channel must be deliberately restarted with it at a safe checkpoint; discovery alone does not enable that path.
 
-## Channel queue protocol (adapter activation pending)
+## Opt-in two-way channel (research preview)
 
-The channel queue binds a registered session UUID, exact Git root, and Claude PID before it accepts messages. `channel-register --session UUID --repo REPO_ID` records that intended target without contacting it. An opted-in channel process binds itself and receives a short-lived private nonce; `channel-send --session UUID --source ACTOR --key EVENT_ID --text MESSAGE` then queues an idempotent message. `channel-read ID` and `channel-watch ID` show its state and reply. These CLI commands do not install or start a channel.
+The channel queue binds a registered session UUID, exact Git root, and Claude PID before it accepts messages. `channel-register --session UUID --repo REPO_ID` records that intended target without contacting it. An opted-in channel process binds itself and receives a private nonce; `channel-send --session UUID --source ACTOR --key EVENT_ID --text MESSAGE` then queues an idempotent message. `channel-read ID` and `channel-watch ID` show its state and reply. Registration and discovery do not install or start a channel.
 
 The states distinguish `queued`, `dispatching`, `emitted`, `completed`, and `unknown`. `emitted` means only that the MCP notification was written to Claude's transport. [Claude does not acknowledge channel notifications](https://code.claude.com/docs/en/channels-reference), so it is **not** proof that the model read the message. `completed` requires a matching call to the channel reply tool. On restart, any message that might have been delivered becomes `unknown`; later messages stay blocked until `channel-resolve ID --reason 'inspection notes'`. The bridge never silently resends an ambiguous request. The channel has no remote permission relay capability, so messages cannot approve Claude's file or command prompts.
+
+The adapter uses the official MCP SDK over stdio, plus a private local SQLite queue. It opens no HTTP port. The Node subprocess invokes Python in isolated import mode with the bridge source path explicitly pinned outside Claude's working directory. The queue's private ACL and the local OS account are its authentication boundary. A different process with the same user's filesystem access remains trusted; this is not an OS sandbox.
+
+### Controlled setup for an existing conversation
+
+Claude Code 2.1.248+ and Node 20+ are required. The channel is **not loaded into an already running session**. At a safe checkpoint, obtain the exact UUID with `python -m gcb.cli targets`, and confirm it with `target-check --session UUID --repo PATH`. Review the requested paths and the [Claude Channels preview warning](https://code.claude.com/docs/en/channels-reference#test-during-the-research-preview) before changing that session. The commands below are templates; do not execute them against another person's session or active worktree:
+
+```powershell
+# From the Agent Relay checkout. Install only the pinned official SDK, without package scripts.
+python -m pip install -e .
+npm --prefix channel ci --ignore-scripts --no-audit --no-fund
+
+$homeDir = Join-Path $HOME '.gcb'
+$repo = (python -m gcb.cli --home $homeDir repo-add 'C:\path\to\the\exact\Git\root' | ConvertFrom-Json).id
+python -m gcb.cli --home $homeDir channel-register --session SESSION_UUID --repo $repo
+python -m gcb.cli --home $homeDir channel-config --session SESSION_UUID > (Join-Path $homeDir 'agent-relay-mcp.json')
+```
+
+After Claude finishes its current turn, exit its terminal session normally. In the **same Git worktree**, resume the same UUID with the reviewed config and Claude's explicit development-channel opt-in:
+
+```powershell
+claude --resume SESSION_UUID --mcp-config (Join-Path $HOME '.gcb\agent-relay-mcp.json') --dangerously-load-development-channels server:agent-relay
+```
+
+Claude Code displays both the custom channel warning and MCP server consent prompt locally. Confirm only after reviewing them. If its process identity, channel availability, or private queue checks fail, the channel will not bind. `python -m gcb.cli channel-status` must show the intended UUID with `healthy: true` before a message is sent. The health check requires a recent poll and expires if the subprocess stops. From an authenticated local Groot task, send one request and poll the same ID:
+
+```powershell
+$request = (python -m gcb.cli channel-send --session SESSION_UUID --source authenticated-user --key stable-event-id --text 'Please review this change.' | ConvertFrom-Json).id
+python -m gcb.cli channel-watch $request --timeout 120
+```
+
+The `source` string is attribution from the trusted caller, not authentication. A response is shown only after Claude calls the channel's `reply` tool for that exact request ID. If Claude requests permission to edit or run commands, approve it in Claude's own terminal; the channel never relays or grants permission. A channel restart after dispatch records `unknown` and requires manual inspection. This route preserves conversation context by resuming its UUID, but a channel-enabled restart and live conversation have **not yet been verified** for an existing terminal session. The laptop must remain awake, online, and running Claude for delivery.
 
 ## Opt-in Claude transport
 
