@@ -8,12 +8,18 @@ import time
 from .adapters import ADAPTERS
 from .core import BridgeError, add_repo, add_session, check_session, claim, connect, finish, public_request, recover, redact, send
 from .patches import apply_reviewed, review
+from .targets import check_target, discover, public_target
 
 
 def parser():
     p = argparse.ArgumentParser(prog="gcb", description="Local Claude Code task bridge; JSON output, no daemon or network listener")
     p.add_argument("--home", default=os.environ.get("GCB_HOME", str(Path.home() / ".gcb")), help="Private queue directory (default: ~/.gcb)")
     sub = p.add_subparsers(dest="command", required=True)
+    x = sub.add_parser("targets", help="Inspect Claude's active sessions without opening a bridge queue")
+    x.add_argument("--include-path", action="store_true", help="Show each session's full working directory")
+    x = sub.add_parser("target-check", help="Verify exact Claude session and repository path; never sends a message")
+    x.add_argument("--session", required=True)
+    x.add_argument("--repo", required=True)
     x = sub.add_parser("repo-add", help="Allowlist an existing Git root")
     x.add_argument("path")
     sub.add_parser("repos", help="List allowlisted repositories")
@@ -62,6 +68,12 @@ def output(obj):
 
 
 def run(args):
+    if args.command == "targets":
+        output([public_target(item,args.include_path) for item in discover()])
+        return
+    if args.command == "target-check":
+        output(check_target(args.session,args.repo))
+        return
     db = connect(args.home)
     try:
         return _run_open(db,args)

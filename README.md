@@ -19,6 +19,12 @@ gcb read $request
 
 `gcb watch $request --timeout 60` waits locally for completion. `gcb sessions` and `gcb repos` list bridge metadata only. Each command emits JSON. `queued` confirms durable storage; it is **not** acknowledgment by Claude. `running` is claimed, and `completed` has a verified final result. A repeated source/key/prompt returns the same request ID. A changed prompt with the same source/key is rejected. The source label is caller supplied and is not authentication; a trusted local task must derive it from its authenticated upstream identity.
 
+## Inspect existing Claude sessions
+
+`gcb targets` runs Claude Code's read-only `agents --json` command without creating a bridge queue. It returns session UUID, kind, status, PID, and a hash of the working directory. `gcb targets --include-path` opts in to displaying the path. `gcb target-check --session UUID --repo PATH` verifies the exact active session and working directory. These commands **do not send** to discovered sessions. An active interactive session is marked `unsupported_active_interactive`; an unregistered background session is marked `background_not_enrolled`. The bridge's `send` command accepts only its own registered session IDs, so discovery cannot silently grant control of another session.
+
+Claude's [CLI reference](https://code.claude.com/docs/en/cli-reference) documents message routing to running background sessions. Its [channels](https://code.claude.com/docs/en/channels) can inject events into an opted-in running session and provide a reply tool, including when the session stays open in a terminal. A session launched without the channel must be deliberately restarted with it at a safe checkpoint; discovery alone does not enable that path.
+
 ## Opt-in Claude transport
 
 `gcb session-add --repo REPO_ID --name trial --adapter claude` creates metadata and a fresh UUID; it does not call Claude. To process its request, `gcb run-once --live --budget-usd 0.05 --timeout 60` requires an explicit per-turn cost cap. Missing live flags or budget leave the request queued. Check your Claude account, selected provider/model, billing terms, settings, and the allowed repository before a real call. The CLI uses whichever account/provider your local Claude Code selects. `--max-budget-usd` is a Claude Code estimate for **one invocation**, not an account spending limit. No paid calls were made during development or tests.
